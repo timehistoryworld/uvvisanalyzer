@@ -145,6 +145,103 @@ def fit_hill(conc, response):
     perr = np.sqrt(np.diag(pcov))
     return popt, perr
 
+# ── 1:1 Binding ───────────────────────────────────────────────────────────────
+def binding_1to1(cG, dA_max, Ka, cH):
+    cG = np.asarray(cG, dtype=float)
+    b  = 1.0 + Ka * (cH + cG)
+    HG = (b - np.sqrt(np.maximum(b**2 - 4 * Ka**2 * cH * cG, 0))) / (2 * Ka)
+    return dA_max * HG / cH
+
+def fit_1to1(conc_G, delta_A, cH_fixed):
+    dA_max0 = float(np.max(np.abs(delta_A))) * 1.2
+    Ka0     = 1.0 / float(np.median(conc_G) + 1e-12)
+    p0      = [dA_max0, Ka0]
+    bounds  = ([0, 1e-6], [dA_max0 * 10, 1e12])
+    popt, pcov = curve_fit(
+        lambda cG, dAm, Ka: binding_1to1(cG, dAm, Ka, cH_fixed),
+        conc_G, delta_A, p0=p0, bounds=bounds, maxfev=20000)
+    perr = np.sqrt(np.diag(pcov))
+    return popt, perr
+
+# ── 1:2 Sequential Binding ────────────────────────────────────────────────────
+def binding_1to2(cG, dA1, dA2, Ka1, Ka2, cH):
+    cG = np.asarray(cG, dtype=float)
+    results = []
+    for g_total in cG:
+        g = g_total
+        for _ in range(200):
+            denom = 1 + Ka1*g + Ka1*Ka2*g**2
+            HG    = Ka1 * cH * g / denom
+            HG2   = Ka1 * Ka2 * cH * g**2 / denom
+            g_new = max(g_total - HG - 2*HG2, 0)
+            if abs(g_new - g) < 1e-12:
+                break
+            g = g_new
+        denom = 1 + Ka1*g + Ka1*Ka2*g**2
+        HG    = Ka1 * cH * g / denom
+        HG2   = Ka1 * Ka2 * cH * g**2 / denom
+        results.append(dA1 * HG / cH + dA2 * HG2 / cH)
+    return np.array(results)
+
+def fit_1to2(conc_G, delta_A, cH_fixed):
+    dAm = float(np.max(np.abs(delta_A)))
+    Ka0 = 1.0 / float(np.median(conc_G) + 1e-12)
+    p0  = [dAm, dAm * 1.5, Ka0, Ka0 * 0.1]
+    bounds = ([0, 0, 1e-6, 1e-6], [dAm*10, dAm*10, 1e12, 1e12])
+    popt, pcov = curve_fit(
+        lambda cG, d1, d2, k1, k2: binding_1to2(cG, d1, d2, k1, k2, cH_fixed),
+        conc_G, delta_A, p0=p0, bounds=bounds, maxfev=30000)
+    perr = np.sqrt(np.diag(pcov))
+    return popt, perr
+
+# ── Isodesmic Aggregation ─────────────────────────────────────────────────────
+def isodesmic_model(cT, eps_mono, eps_agg, Kagg):
+    cT   = np.asarray(cT, dtype=float)
+    x    = 4 * Kagg * cT
+    mono_frac = np.where(
+        x < 1,
+        (1 - np.sqrt(np.maximum(1 - x, 0))) / (2 * Kagg * cT + 1e-30),
+        0.5 / (Kagg * cT + 1e-30))
+    mono_frac = np.clip(mono_frac, 0, 1)
+    return eps_agg + (eps_mono - eps_agg) * mono_frac
+
+def fit_isodesmic(conc, absorb, path_len=1.0):
+    eps_obs = absorb / (np.asarray(conc) * path_len + 1e-30)
+    eps_m0  = float(eps_obs[0])
+    eps_a0  = float(eps_obs[-1])
+    Ka0     = 1.0 / float(np.median(conc) + 1e-12)
+    p0      = [eps_m0, eps_a0, Ka0]
+    bounds  = ([0, 0, 1e-6], [eps_m0*5, eps_m0*5, 1e12])
+    popt, pcov = curve_fit(isodesmic_model, conc, eps_obs,
+                           p0=p0, bounds=bounds, maxfev=20000)
+    perr = np.sqrt(np.diag(pcov))
+    return popt, perr, eps_obs
+
+# ── Dimerization ──────────────────────────────────────────────────────────────
+def dimerization_model(cT, eps_mono, eps_dim, Kdim):
+    cT  = np.asarray(cT, dtype=float)
+    M   = (-1 + np.sqrt(np.maximum(1 + 8 * Kdim * cT, 0))) / (4 * Kdim + 1e-30)
+    D   = Kdim * M**2
+    return (eps_mono * M + 2 * eps_dim * D) / (cT + 1e-30)
+
+def fit_dimerization(conc, absorb, path_len=1.0):
+    eps_obs = absorb / (np.asarray(conc) * path_len + 1e-30)
+    eps_m0  = float(eps_obs[0])
+    eps_d0  = float(eps_obs[-1])
+    Kdim0   = 1.0 / float(np.median(conc) + 1e-12)
+    p0      = [eps_m0, eps_d0, Kdim0]
+    bounds  = ([0, 0, 1e-6], [eps_m0*5, eps_m0*5, 1e12])
+    popt, pcov = curve_fit(dimerization_model, conc, eps_obs,
+                           p0=p0, bounds=bounds, maxfev=20000)
+    perr = np.sqrt(np.diag(pcov))
+    return popt, perr, eps_obs
+
+# ── Scatchard transform ───────────────────────────────────────────────────────
+def scatchard_transform(conc_free, A_obs, A_min, A_max):
+    r      = (A_obs - A_min) / (A_max - A_min + 1e-30)
+    r_over = r / (conc_free + 1e-30)
+    return r, r_over
+
 def find_isosbestic(spectra_list, tol_abs=0.02, tol_nm=2.0):
     x_min = max(s[0][0]  for s in spectra_list)
     x_max = min(s[0][-1] for s in spectra_list)
@@ -275,71 +372,189 @@ with tab2:
         if df2 is None:
             st.error("Could not parse CSV.")
         else:
-            x2, y2 = sort_spectrum(df2)
+            x2_full, y2_full = sort_spectrum(df2)
+
+            # ── 1. Wavelength range selector ──────────────────────────────────
+            st.subheader("① Wavelength Range")
+            wl_min_data = float(x2_full[0])
+            wl_max_data = float(x2_full[-1])
+            col_r1, col_r2 = st.columns(2)
+            wl_lo = col_r1.number_input("From (nm)", value=wl_min_data,
+                                         min_value=wl_min_data, max_value=wl_max_data,
+                                         step=1.0, key="wl_lo")
+            wl_hi = col_r2.number_input("To (nm)",   value=wl_max_data,
+                                         min_value=wl_min_data, max_value=wl_max_data,
+                                         step=1.0, key="wl_hi")
+            if wl_lo >= wl_hi:
+                st.error("'From' must be smaller than 'To'.")
+                st.stop()
+
+            mask = (x2_full >= wl_lo) & (x2_full <= wl_hi)
+            x2   = x2_full[mask]
+            y2   = y2_full[mask]
+
+            if len(x2) < 5:
+                st.error("Too few points in selected range. Widen the range.")
+                st.stop()
+
+            # ── 2. Global fit settings ────────────────────────────────────────
+            st.subheader("② Global Settings")
             c1, c2 = st.columns(2)
             n_bands = c1.slider("Number of Gaussian bands", 1, 8, 2, key="nb")
-            sg_w2   = c2.slider("Smoothing window", 5, 51, 11, 2, key="sg2")
+            sg_w2   = c2.slider("Smoothing window (auto-guess)", 5, 51, 11, 2, key="sg2")
+
+            # ── 3. Per-band parameters + fix checkboxes ───────────────────────
+            st.subheader("③ Band Parameters  (check ✔ to fix a value during fit)")
 
             p0_auto = auto_initial_guess(x2, y2, n_bands)
-            st.markdown("**Adjust initial guesses per band:**")
-            hc = st.columns([2, 2, 2])
-            hc[0].markdown("**Amplitude**")
-            hc[1].markdown("**Center (nm)**")
-            hc[2].markdown("**Width σ (nm)**")
-            params_ui = []
+
+            # Header row
+            h = st.columns([1.2, 2.2, 0.7, 2.2, 0.7, 2.2, 0.7])
+            h[0].markdown("**Band**")
+            h[1].markdown("**Amplitude**");   h[2].markdown("**fix**")
+            h[3].markdown("**Center (nm)**"); h[4].markdown("**fix**")
+            h[5].markdown("**Width σ (nm)**");h[6].markdown("**fix**")
+
+            band_params  = []   # list of dicts: amp, cen, sig, fix_amp, fix_cen, fix_sig
             for i in range(n_bands):
-                cc = st.columns([2, 2, 2])
-                amp = cc[0].number_input(f"B{i+1} amp", value=round(float(p0_auto[3*i]),   4), step=0.01, key=f"amp{i}")
-                cen = cc[1].number_input(f"B{i+1} cen", value=round(float(p0_auto[3*i+1]), 1), step=1.0,  key=f"cen{i}")
-                sig = cc[2].number_input(f"B{i+1} σ",   value=round(abs(float(p0_auto[3*i+2])), 1), step=1.0, key=f"sig{i}")
-                params_ui += [amp, cen, sig]
+                row = st.columns([1.2, 2.2, 0.7, 2.2, 0.7, 2.2, 0.7])
+                row[0].markdown(f"**Band {i+1}**")
+                amp     = row[1].number_input("", value=round(float(p0_auto[3*i]),    4), step=0.001, format="%.4f", key=f"amp{i}", label_visibility="collapsed")
+                fix_amp = row[2].checkbox("",  key=f"fix_amp{i}", label_visibility="collapsed")
+                cen     = row[3].number_input("", value=round(float(p0_auto[3*i+1]),  2), step=0.5,   format="%.2f", key=f"cen{i}", label_visibility="collapsed")
+                fix_cen = row[4].checkbox("",  key=f"fix_cen{i}", label_visibility="collapsed")
+                sig     = row[5].number_input("", value=round(abs(float(p0_auto[3*i+2])), 2), step=0.5, format="%.2f", key=f"sig{i}", label_visibility="collapsed")
+                fix_sig = row[6].checkbox("",  key=f"fix_sig{i}", label_visibility="collapsed")
+                band_params.append(dict(amp=amp, cen=cen, sig=sig,
+                                        fix_amp=fix_amp, fix_cen=fix_cen, fix_sig=fix_sig))
+
+            # show fixed summary
+            fixed_list = []
+            for i, bp in enumerate(band_params):
+                for pname in ('amp', 'cen', 'sig'):
+                    if bp[f'fix_{pname}']:
+                        fixed_list.append(f"Band {i+1} {pname}={bp[pname]:.3g}")
+            if fixed_list:
+                st.markdown(f'<div class="info-box">🔒 Fixed: {" · ".join(fixed_list)}</div>',
+                            unsafe_allow_html=True)
 
             if st.button("▶ Run Gaussian Fit", type="primary", key="gauss_btn"):
                 try:
-                    blo = [0,     x2[0],  0.5] * n_bands
-                    bhi = [1e4,  x2[-1], (x2[-1]-x2[0])/2] * n_bands
-                    popt, pcov = curve_fit(multi_gaussian, x2, y2, p0=params_ui,
-                                           bounds=(blo, bhi), maxfev=20000)
-                    perr = np.sqrt(np.diag(pcov))
-                    yfit  = multi_gaussian(x2, *popt)
-                    resid = y2 - yfit
-                    r2    = 1 - np.sum(resid**2) / np.sum((y2 - np.mean(y2))**2)
+                    # Build free-parameter list and a wrapper that inserts fixed values
+                    full_p0   = []   # all 3*n values (initial)
+                    is_fixed  = []   # bool per parameter
+                    for bp in band_params:
+                        full_p0  += [bp['amp'],     bp['cen'],     bp['sig']]
+                        is_fixed += [bp['fix_amp'], bp['fix_cen'], bp['fix_sig']]
 
+                    fixed_vals = [v for v, f in zip(full_p0, is_fixed) if f]
+                    free_p0    = [v for v, f in zip(full_p0, is_fixed) if not f]
+                    free_idx   = [i for i, f in enumerate(is_fixed) if not f]
+
+                    if not free_p0:
+                        # All fixed — just evaluate directly
+                        yfit  = multi_gaussian(x2, *full_p0)
+                        popt_full = np.array(full_p0)
+                        perr_full = np.zeros(len(full_p0))
+                    else:
+                        def fit_wrapper(x_data, *free_params):
+                            p = list(full_p0)           # start from fixed values
+                            for idx_f, val in zip(free_idx, free_params):
+                                p[idx_f] = val
+                            return multi_gaussian(x_data, *p)
+
+                        # Bounds for free params only
+                        blo_all = [0,    x2[0],  0.5] * n_bands
+                        bhi_all = [1e4, x2[-1], (x2[-1]-x2[0])/2] * n_bands
+                        blo_free = [blo_all[i] for i in free_idx]
+                        bhi_free = [bhi_all[i] for i in free_idx]
+
+                        popt_free, pcov_free = curve_fit(
+                            fit_wrapper, x2, y2, p0=free_p0,
+                            bounds=(blo_free, bhi_free), maxfev=30000)
+
+                        perr_free = np.sqrt(np.diag(pcov_free))
+
+                        # Reconstruct full parameter array
+                        popt_full = np.array(full_p0, dtype=float)
+                        perr_full = np.zeros(len(full_p0))
+                        for k, (idx_f, val, err) in enumerate(
+                                zip(free_idx, popt_free, perr_free)):
+                            popt_full[idx_f] = val
+                            perr_full[idx_f] = err
+
+                        yfit = multi_gaussian(x2, *popt_full)
+
+                    resid = y2 - yfit
+                    ss_res = np.sum(resid**2)
+                    ss_tot = np.sum((y2 - np.mean(y2))**2)
+                    r2     = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+                    # ── Plot ──
                     fig2 = go.Figure()
-                    fig2.add_trace(go.Scatter(x=x2, y=y2, name="Data",
+                    # Show full spectrum in background (lighter)
+                    fig2.add_trace(go.Scatter(x=x2_full, y=y2_full, name="Full spectrum",
+                                              line=dict(color='lightgray', width=1.5),
+                                              showlegend=True))
+                    # Fit range data
+                    fig2.add_trace(go.Scatter(x=x2, y=y2, name="Fit range data",
                                               line=dict(color='black', width=2)))
                     fig2.add_trace(go.Scatter(x=x2, y=yfit,
                                               name=f"Total fit (R²={r2:.4f})",
-                                              line=dict(color='red', width=2, dash='dash')))
+                                              line=dict(color='red', width=2.5, dash='dash')))
+
+                    # Fit range shading
+                    fig2.add_vrect(x0=wl_lo, x1=wl_hi,
+                                   fillcolor='rgba(100,180,255,0.07)',
+                                   line_width=1, line_dash='dot', line_color='steelblue',
+                                   annotation_text="fit range", annotation_position="top left")
+
                     band_rows = []
                     fit_df    = pd.DataFrame({'wavelength_nm': x2, 'absorbance': y2,
-                                             'total_fit': yfit, 'residuals': resid})
+                                              'total_fit': yfit, 'residuals': resid})
                     for i in range(n_bands):
-                        ai, ci, si = popt[3*i], popt[3*i+1], abs(popt[3*i+2])
+                        ai  = popt_full[3*i]
+                        ci  = popt_full[3*i+1]
+                        si  = abs(popt_full[3*i+2])
+                        e_a = perr_full[3*i]
+                        e_c = perr_full[3*i+1]
+                        e_s = perr_full[3*i+2]
                         yb   = gaussian(x2, ai, ci, si)
                         fwhm = 2.355 * si
                         area = ai * si * np.sqrt(2 * np.pi)
                         col  = QUAL_COLORS[i % len(QUAL_COLORS)]
-                        fig2.add_trace(go.Scatter(x=x2, y=yb,
-                            name=f"Band {i+1}: {ci:.1f} nm",
-                            line=dict(color=col, width=1.5),
-                            fill='tozeroy'))
+
+                        fix_tag = []
+                        if band_params[i]['fix_amp']: fix_tag.append("amp🔒")
+                        if band_params[i]['fix_cen']: fix_tag.append("cen🔒")
+                        if band_params[i]['fix_sig']: fix_tag.append("σ🔒")
+                        label = f"Band {i+1}: {ci:.1f} nm" + (f" [{','.join(fix_tag)}]" if fix_tag else "")
+
+                        fig2.add_trace(go.Scatter(x=x2, y=yb, name=label,
+                                                   line=dict(color=col, width=1.5),
+                                                   fill='tozeroy'))
+
+                        def fmt(val, err, fixed):
+                            return f"{val:.4f} (fixed)" if fixed else f"{val:.4f} ± {err:.4f}"
+
                         band_rows.append({
-                            'Band': i+1,
-                            'Center (nm)': f"{ci:.2f} ± {perr[3*i+1]:.2f}",
-                            'Amplitude':   f"{ai:.4f} ± {perr[3*i]:.4f}",
-                            'σ (nm)':      f"{si:.2f}",
-                            'FWHM (nm)':   f"{fwhm:.2f}",
-                            'Area (a.u.)': f"{area:.4f}",
+                            'Band':          i + 1,
+                            'Center (nm)':   fmt(ci, e_c, band_params[i]['fix_cen']),
+                            'Amplitude':     fmt(ai, e_a, band_params[i]['fix_amp']),
+                            'σ (nm)':        fmt(si, e_s, band_params[i]['fix_sig']),
+                            'FWHM (nm)':     f"{fwhm:.3f}",
+                            'Area (a.u.)':   f"{area:.5f}",
                             'Interpretation': science_note(ci, 'max'),
                         })
                         fit_df[f'band_{i+1}'] = yb
 
                     fig2.add_trace(go.Scatter(x=x2, y=resid, name="Residuals",
                                               line=dict(color='gray', width=1), yaxis='y2'))
-                    fig2.update_layout(height=560, hovermode='x unified',
+                    fig2.update_layout(
+                        height=580, hovermode='x unified',
                         xaxis_title="Wavelength (nm)", yaxis_title="Absorbance",
-                        yaxis2=dict(title="Residuals", overlaying='y', side='right', showgrid=False),
+                        yaxis2=dict(title="Residuals", overlaying='y', side='right',
+                                    showgrid=False, zeroline=True),
                         legend=dict(x=1.05, y=1))
                     st.plotly_chart(fig2, use_container_width=True)
 
@@ -350,56 +565,120 @@ with tab2:
                     xl2 = df_to_excel_bytes({'Fit Curves': fit_df, 'Band Parameters': band_df})
                     st.download_button("⬇ Download Excel", xl2, file_name="gaussian_fit.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
                 except Exception as e:
-                    st.error(f"Fitting failed: {e}. Try adjusting initial parameters.")
+                    st.error(f"Fitting failed: {e}. Try adjusting initial parameters or unfixing some values.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 3 — Titration & Hill Equation
+# TAB 3 — Titration & Binding Models
 # ─────────────────────────────────────────────────────────────────────────────
 with tab3:
-    st.header("Titration Analysis + Hill Equation Fitting")
-    st.markdown("""
+    st.header("Titration Analysis & Binding / Aggregation Fitting")
+
+    MODEL_INFO = {
+        "Hill (cooperative binding)": {
+            "eq": "A = A_min + (A_max−A_min)·[L]ⁿ / (Kd ⁿ+[L]ⁿ)",
+            "params": "Kd, Hill n",
+            "use": "General binding, cooperativity screening",
+            "input": "titration",
+        },
+        "1:1 Binding (Ka)": {
+            "eq": "ΔA = ΔA_max·[HG] / cH  (quadratic)",
+            "params": "Ka = 1/Kd",
+            "use": "Host-guest, metal-ligand, simple 1:1",
+            "input": "titration",
+        },
+        "1:2 Sequential Binding": {
+            "eq": "ΔA = ΔA₁·[HG]/cH + ΔA₂·[HG₂]/cH",
+            "params": "Ka1, Ka2",
+            "use": "Two-step binding, ditopic hosts",
+            "input": "titration",
+        },
+        "Isodesmic Aggregation": {
+            "eq": "ε_app = ε_agg + (ε_mono−ε_agg)·f_mono(Kagg, cT)",
+            "params": "ε_mono, ε_agg, Kagg",
+            "use": "J/H-aggregation, self-assembly, dilution series",
+            "input": "concentration_series",
+        },
+        "Dimerization": {
+            "eq": "ε_app = (ε_mono·[M] + 2ε_dim·[D]) / cT",
+            "params": "ε_mono, ε_dim, Kdim",
+            "use": "Dye dimerization, dilution experiment",
+            "input": "concentration_series",
+        },
+    }
+
+    # Model selector with info
+    model_choice = st.selectbox("Select fitting model", list(MODEL_INFO.keys()))
+    info = MODEL_INFO[model_choice]
+    st.markdown(f"""
 <div class="info-box">
-Upload one CSV per titration point. Dilution is corrected automatically.<br>
-<b>Hill equation</b>: A = A<sub>min</sub> + (A<sub>max</sub> − A<sub>min</sub>) · [L]<sup>n</sup> / (K<sub>d</sub><sup>n</sup> + [L]<sup>n</sup>)<br>
-n = 1: simple 1:1 binding &nbsp;|&nbsp; n &gt; 1: positive cooperativity &nbsp;|&nbsp; n &lt; 1: negative cooperativity
+<b>Equation:</b> {info["eq"]}<br>
+<b>Parameters:</b> {info["params"]}<br>
+<b>Typical use:</b> {info["use"]}
 </div>""", unsafe_allow_html=True)
 
-    tit_files = st.file_uploader("Upload titration CSVs (one per point)", type="csv",
-                                  accept_multiple_files=True, key="t3")
+    is_conc_series = info["input"] == "concentration_series"
+
+    tit_files = st.file_uploader(
+        "Upload CSVs — one per titration point (or concentration point for aggregation)",
+        type="csv", accept_multiple_files=True, key="t3")
 
     if tit_files:
         tit_files = sorted(tit_files, key=lambda f: f.name)
         n_tit = len(tit_files)
-        st.success(f"{n_tit} files: {', '.join(f.name for f in tit_files)}")
+        st.success(f"{n_tit} files loaded.")
 
         st.subheader("Experimental Setup")
         c1, c2, c3 = st.columns(3)
-        c_titrant  = c1.number_input("Titrant conc. (mM)",        value=1.0,  step=0.1,  min_value=0.0)
-        c_analyte  = c2.number_input("Analyte conc. (mM)",         value=0.1,  step=0.01, min_value=0.0)
-        V0         = c3.number_input("Initial analyte vol. (mL)",  value=2.0,  step=0.1,  min_value=0.0)
-        eps0       = c1.number_input("ε₀ at λref (M⁻¹cm⁻¹, 0=skip)", value=0.0, step=100.0)
-        path_len   = c2.number_input("Path length (cm)",           value=1.0,  step=0.1,  min_value=0.1)
-        do_hill    = c3.checkbox("Fit Hill equation", value=True)
+        path_len  = c1.number_input("Path length (cm)", value=1.0, step=0.1, min_value=0.1)
 
-        st.markdown("**Volume of titrant added at each point (mL):**")
-        vol_cols = st.columns(min(n_tit, 6))
-        vols = []
-        for i, f in enumerate(tit_files):
-            v = vol_cols[i % 6].number_input(f.name[:10], value=float(i)*0.2,
-                                              step=0.05, min_value=0.0, key=f"vol{i}")
-            vols.append(v)
+        if is_conc_series:
+            # Aggregation / Dimerization: user enters total concentration per file
+            st.markdown("**Total concentration at each point (mM):**")
+            conc_cols = st.columns(min(n_tit, 6))
+            conc_inputs = []
+            for i, f in enumerate(tit_files):
+                c = conc_cols[i % 6].number_input(f.name[:10],
+                    value=float(i+1)*0.05, step=0.01, min_value=0.0, key=f"conc{i}")
+                conc_inputs.append(c)
+            vols       = [0.0] * n_tit
+            c_titrant  = 0.0
+            c_analyte  = 1.0
+            V0         = 1.0
+            eps0       = 0.0
+        else:
+            c_titrant = c2.number_input("Titrant conc. (mM)",       value=1.0,  step=0.1,  min_value=0.0)
+            c_analyte = c3.number_input("Analyte conc. (mM)",        value=0.1,  step=0.01, min_value=0.0)
+            V0        = c1.number_input("Initial analyte vol. (mL)", value=2.0,  step=0.1,  min_value=0.0)
+            eps0      = c2.number_input("ε₀ at λref (M⁻¹cm⁻¹, 0=skip)", value=0.0, step=100.0)
+            conc_inputs = []
+            st.markdown("**Volume of titrant added at each point (mL):**")
+            vol_cols = st.columns(min(n_tit, 6))
+            vols = []
+            for i, f in enumerate(tit_files):
+                v = vol_cols[i % 6].number_input(f.name[:10], value=float(i)*0.2,
+                                                  step=0.05, min_value=0.0, key=f"vol{i}")
+                vols.append(v)
 
-        if st.button("▶ Compute Titration", type="primary", key="tit_btn"):
+        # Scatchard option (only for 1:1)
+        show_scatchard = False
+        if model_choice == "1:1 Binding (Ka)":
+            show_scatchard = st.checkbox("Also show Scatchard plot", value=True)
+
+        if st.button("▶ Run Analysis", type="primary", key="tit_btn"):
             spectra_tit = []
-            for f, v in zip(tit_files, vols):
+            for idx_f, (f, v) in enumerate(zip(tit_files, vols)):
                 df_t = load_csv(f)
                 if df_t is None:
                     continue
                 xt, yt = sort_spectrum(df_t)
-                V_total = V0 + v
-                dil     = V0 / V_total if V_total > 0 else 1.0
-                spectra_tit.append((xt, yt / dil, v))
+                if is_conc_series:
+                    spectra_tit.append((xt, yt, conc_inputs[idx_f]))
+                else:
+                    V_total = V0 + v
+                    dil     = V0 / V_total if V_total > 0 else 1.0
+                    spectra_tit.append((xt, yt / dil, v))
 
             if not spectra_tit:
                 st.error("No valid spectra.")
@@ -412,84 +691,207 @@ n = 1: simple 1:1 binding &nbsp;|&nbsp; n &gt; 1: positive cooperativity &nbsp;|
                 grad = [f"hsl({int(360*i/max(len(spectra_tit)-1,1))},70%,50%)"
                         for i in range(len(spectra_tit))]
 
-                A_vals, conc_free, equiv_vals = [], [], []
-                for xt, yt_c, v in spectra_tit:
+                # Build A_vals and x-axis values
+                A_vals, x_axis_vals, conc_free_vals, equiv_vals = [], [], [], []
+                for idx_s, (xt, yt_c, param) in enumerate(spectra_tit):
                     a = float(np.interp(ref_nm_tit, xt, yt_c))
-                    if eps0 > 0:
+                    if eps0 > 0 and not is_conc_series:
                         a = a / (eps0 * path_len * c_analyte * 1e-3)
                     A_vals.append(a)
-                    V_total = V0 + v
-                    conc_free.append((c_titrant * v / V_total) if V_total > 0 else 0.0)
-                    equiv_vals.append((c_titrant * v) / (c_analyte * V0)
-                                      if (c_analyte * V0) > 0 else v)
+                    if is_conc_series:
+                        x_axis_vals.append(param)   # total conc (mM)
+                        conc_free_vals.append(param)
+                    else:
+                        v = param
+                        V_total = V0 + v
+                        cf = (c_titrant * v / V_total) if V_total > 0 else 0.0
+                        eq = (c_titrant * v) / (c_analyte * V0) if (c_analyte * V0) > 0 else v
+                        x_axis_vals.append(eq)
+                        conc_free_vals.append(cf)
+                        equiv_vals.append(eq)
 
+                # ── Spectra panel ──
                 fig3 = make_subplots(1, 2,
-                    subplot_titles=("Dilution-Corrected Spectra", "Binding Curve"))
-                for idx, (xt, yt_c, v) in enumerate(spectra_tit):
-                    fig3.add_trace(go.Scatter(x=xt, y=yt_c, name=f"V={v:.2f} mL",
-                                              line=dict(color=grad[idx], width=1.5)), 1, 1)
-                fig3.add_trace(go.Scatter(x=equiv_vals, y=A_vals, mode='markers',
-                    name="Data", marker=dict(size=9, color='steelblue')), 1, 2)
+                    subplot_titles=("Corrected Spectra",
+                                    "Binding / Aggregation Curve"))
+                for idx_s, (xt, yt_c, _) in enumerate(spectra_tit):
+                    fig3.add_trace(go.Scatter(x=xt, y=yt_c,
+                        name=f"#{idx_s+1}", line=dict(color=grad[idx_s], width=1.5)), 1, 1)
 
-                hill_result = {}
-                if do_hill and len(A_vals) >= 4:
-                    try:
-                        ca = np.array(conc_free) + 1e-12
-                        Aa = np.array(A_vals)
-                        popt_h, perr_h = fit_hill(ca, Aa)
+                x_data = np.array(conc_free_vals if is_conc_series else conc_free_vals) + 1e-12
+                A_arr  = np.array(A_vals)
+
+                fig3.add_trace(go.Scatter(x=np.array(x_axis_vals), y=A_arr,
+                    mode='markers', name="Data",
+                    marker=dict(size=9, color='steelblue')), 1, 2)
+
+                fit_result = {}
+                fit_rows   = []
+
+                try:
+                    x_fit_range = np.linspace(x_data.min(), x_data.max(), 400)
+
+                    if model_choice == "Hill (cooperative binding)":
+                        popt_h, perr_h = fit_hill(x_data, A_arr)
                         A_min_h, A_max_h, Kd_h, n_h = popt_h
-                        Kd_err, n_err = perr_h[2], perr_h[3]
-
-                        x_fit    = np.linspace(ca.min(), ca.max(), 400)
-                        y_fit_h  = hill_equation(x_fit, *popt_h)
-                        eq_fit   = x_fit / (c_titrant / 1) if c_titrant > 0 else x_fit
-
-                        fig3.add_trace(go.Scatter(x=eq_fit, y=y_fit_h,
-                            name=f"Hill fit  Kd={Kd_h:.4f} mM  n={n_h:.2f}",
-                            line=dict(color='crimson', width=2.5, dash='dash')), 1, 2)
-
+                        y_fit_line = hill_equation(x_fit_range, *popt_h)
+                        eq_fit = x_fit_range / (c_titrant if c_titrant > 0 else 1)
                         cooperativity = ('Positive cooperativity' if n_h > 1.1
                                          else 'Negative cooperativity' if n_h < 0.9
                                          else 'Non-cooperative (1:1)')
-                        hill_result = {
-                            'A_min': round(A_min_h, 5),
-                            'A_max': round(A_max_h, 5),
-                            'Kd (mM)': f"{Kd_h:.4f} ± {Kd_err:.4f}",
-                            'Hill n':  f"{n_h:.3f} ± {n_err:.3f}",
-                            'Interpretation': cooperativity,
-                        }
-                    except Exception as e:
-                        st.warning(f"Hill fitting failed: {e}")
+                        fig3.add_trace(go.Scatter(x=eq_fit, y=y_fit_line,
+                            name=f"Hill fit  Kd={Kd_h:.4f} mM  n={n_h:.2f}",
+                            line=dict(color='crimson', width=2.5, dash='dash')), 1, 2)
+                        fit_rows = [
+                            {'Parameter': 'A_min',  'Value': f"{A_min_h:.5f}", 'Error': f"±{perr_h[0]:.5f}"},
+                            {'Parameter': 'A_max',  'Value': f"{A_max_h:.5f}", 'Error': f"±{perr_h[1]:.5f}"},
+                            {'Parameter': 'Kd (mM)','Value': f"{Kd_h:.5f}",   'Error': f"±{perr_h[2]:.5f}"},
+                            {'Parameter': 'Hill n', 'Value': f"{n_h:.4f}",    'Error': f"±{perr_h[3]:.4f}"},
+                            {'Parameter': 'Ka (mM⁻¹)', 'Value': f"{1/Kd_h:.4f}", 'Error': '—'},
+                            {'Parameter': 'Interpretation', 'Value': cooperativity, 'Error': ''},
+                        ]
 
-                ylabel2 = "A / (ε₀·l·c₀)" if eps0 > 0 else f"A_corr @ {ref_nm_tit:.0f} nm"
+                    elif model_choice == "1:1 Binding (Ka)":
+                        delta_A = A_arr - A_arr[0]
+                        cH_fixed = c_analyte * 1e-3  # M
+                        cG_M     = x_data * 1e-3      # mM → M
+                        popt_b, perr_b = fit_1to1(cG_M, delta_A, cH_fixed)
+                        dA_max_b, Ka_b = popt_b
+                        y_fit_b = binding_1to1(x_fit_range * 1e-3, dA_max_b, Ka_b, cH_fixed) + A_arr[0]
+                        eq_fit  = x_fit_range / (c_titrant if c_titrant > 0 else 1)
+                        fig3.add_trace(go.Scatter(x=eq_fit, y=y_fit_b,
+                            name=f"1:1 fit  Ka={Ka_b:.3e} M⁻¹",
+                            line=dict(color='crimson', width=2.5, dash='dash')), 1, 2)
+                        fit_rows = [
+                            {'Parameter': 'ΔA_max',    'Value': f"{dA_max_b:.5f}", 'Error': f"±{perr_b[0]:.5f}"},
+                            {'Parameter': 'Ka (M⁻¹)',  'Value': f"{Ka_b:.4e}",     'Error': f"±{perr_b[1]:.4e}"},
+                            {'Parameter': 'Kd (M)',    'Value': f"{1/Ka_b:.4e}",   'Error': '—'},
+                            {'Parameter': 'Kd (mM)',   'Value': f"{1000/Ka_b:.4f}",'Error': '—'},
+                            {'Parameter': 'ΔG° (kJ/mol)', 'Value': f"{-8.314e-3*298*np.log(Ka_b):.2f}", 'Error': '—'},
+                        ]
+                        fit_result['scatchard'] = (delta_A, x_data * 1e-3, Ka_b, dA_max_b, A_arr[0])
+
+                    elif model_choice == "1:2 Sequential Binding":
+                        delta_A  = A_arr - A_arr[0]
+                        cH_fixed = c_analyte * 1e-3
+                        cG_M     = x_data * 1e-3
+                        popt_12, perr_12 = fit_1to2(cG_M, delta_A, cH_fixed)
+                        dA1, dA2, Ka1, Ka2 = popt_12
+                        y_fit_12 = binding_1to2(x_fit_range * 1e-3, dA1, dA2, Ka1, Ka2, cH_fixed) + A_arr[0]
+                        eq_fit   = x_fit_range / (c_titrant if c_titrant > 0 else 1)
+                        fig3.add_trace(go.Scatter(x=eq_fit, y=y_fit_12,
+                            name=f"1:2 fit  Ka1={Ka1:.2e} Ka2={Ka2:.2e}",
+                            line=dict(color='crimson', width=2.5, dash='dash')), 1, 2)
+                        fit_rows = [
+                            {'Parameter': 'ΔA₁_max',  'Value': f"{dA1:.5f}",  'Error': f"±{perr_12[0]:.5f}"},
+                            {'Parameter': 'ΔA₂_max',  'Value': f"{dA2:.5f}",  'Error': f"±{perr_12[1]:.5f}"},
+                            {'Parameter': 'Ka1 (M⁻¹)','Value': f"{Ka1:.4e}",  'Error': f"±{perr_12[2]:.4e}"},
+                            {'Parameter': 'Ka2 (M⁻¹)','Value': f"{Ka2:.4e}",  'Error': f"±{perr_12[3]:.4e}"},
+                            {'Parameter': 'Kd1 (mM)', 'Value': f"{1000/Ka1:.4f}", 'Error': '—'},
+                            {'Parameter': 'Kd2 (mM)', 'Value': f"{1000/Ka2:.4f}", 'Error': '—'},
+                        ]
+
+                    elif model_choice == "Isodesmic Aggregation":
+                        popt_iso, perr_iso, eps_obs = fit_isodesmic(
+                            np.array(conc_free_vals) * 1e-3, A_arr, path_len)
+                        eps_m, eps_a, Kagg = popt_iso
+                        cT_fit = np.linspace(min(conc_free_vals)*1e-3, max(conc_free_vals)*1e-3, 400)
+                        eps_fit = isodesmic_model(cT_fit, *popt_iso)
+                        fig3.update_traces(selector=dict(name="Data"), y=eps_obs, row=1, col=2)
+                        fig3.add_trace(go.Scatter(
+                            x=np.array(conc_free_vals), y=eps_obs,
+                            mode='markers', name="ε_obs",
+                            marker=dict(size=9, color='steelblue')), 1, 2)
+                        fig3.add_trace(go.Scatter(
+                            x=cT_fit * 1e3, y=eps_fit,
+                            name=f"Isodesmic  Kagg={Kagg:.3e} M⁻¹",
+                            line=dict(color='crimson', width=2.5, dash='dash')), 1, 2)
+                        fit_rows = [
+                            {'Parameter': 'ε_monomer (M⁻¹cm⁻¹)', 'Value': f"{eps_m:.2f}", 'Error': f"±{perr_iso[0]:.2f}"},
+                            {'Parameter': 'ε_aggregate (M⁻¹cm⁻¹)','Value': f"{eps_a:.2f}", 'Error': f"±{perr_iso[1]:.2f}"},
+                            {'Parameter': 'Kagg (M⁻¹)',            'Value': f"{Kagg:.4e}",  'Error': f"±{perr_iso[2]:.4e}"},
+                            {'Parameter': 'ΔG_agg° (kJ/mol)',       'Value': f"{-8.314e-3*298*np.log(Kagg):.2f}", 'Error': '—'},
+                        ]
+
+                    elif model_choice == "Dimerization":
+                        popt_dim, perr_dim, eps_obs = fit_dimerization(
+                            np.array(conc_free_vals) * 1e-3, A_arr, path_len)
+                        eps_m, eps_d, Kdim = popt_dim
+                        cT_fit = np.linspace(min(conc_free_vals)*1e-3, max(conc_free_vals)*1e-3, 400)
+                        eps_fit = dimerization_model(cT_fit, *popt_dim)
+                        fig3.add_trace(go.Scatter(
+                            x=np.array(conc_free_vals), y=eps_obs,
+                            mode='markers', name="ε_obs",
+                            marker=dict(size=9, color='steelblue')), 1, 2)
+                        fig3.add_trace(go.Scatter(
+                            x=cT_fit * 1e3, y=eps_fit,
+                            name=f"Dimerization  Kdim={Kdim:.3e} M⁻¹",
+                            line=dict(color='crimson', width=2.5, dash='dash')), 1, 2)
+                        fit_rows = [
+                            {'Parameter': 'ε_monomer (M⁻¹cm⁻¹)', 'Value': f"{eps_m:.2f}", 'Error': f"±{perr_dim[0]:.2f}"},
+                            {'Parameter': 'ε_dimer (M⁻¹cm⁻¹)',   'Value': f"{eps_d:.2f}", 'Error': f"±{perr_dim[1]:.2f}"},
+                            {'Parameter': 'Kdim (M⁻¹)',           'Value': f"{Kdim:.4e}",  'Error': f"±{perr_dim[2]:.4e}"},
+                            {'Parameter': 'ΔG_dim° (kJ/mol)',      'Value': f"{-8.314e-3*298*np.log(Kdim):.2f}", 'Error': '—'},
+                        ]
+
+                except Exception as e:
+                    st.error(f"Fitting failed: {e}")
+                    fit_rows = []
+
+                x2_label = "Concentration (mM)" if is_conc_series else "Equivalents of titrant"
+                y2_label = "ε_app (M⁻¹cm⁻¹)" if is_conc_series else (
+                    "A / (ε₀·l·c₀)" if eps0 > 0 else f"A @ {ref_nm_tit:.0f} nm")
                 fig3.update_layout(height=480, hovermode='x unified',
-                    xaxis_title="Wavelength (nm)", yaxis_title="Corrected Absorbance",
-                    xaxis2_title="Equivalents of titrant", yaxis2_title=ylabel2,
+                    xaxis_title="Wavelength (nm)", yaxis_title="Absorbance",
+                    xaxis2_title=x2_label, yaxis2_title=y2_label,
                     legend=dict(x=1.02, y=1))
                 st.plotly_chart(fig3, use_container_width=True)
 
-                if hill_result:
-                    st.markdown(f"""
+                if fit_rows:
+                    fit_df = pd.DataFrame(fit_rows)
+                    st.subheader("Fit Results")
+                    st.dataframe(fit_df, use_container_width=True, hide_index=True)
+
+                # ── Scatchard plot ──
+                if show_scatchard and 'scatchard' in fit_result:
+                    delta_A_s, cG_M_s, Ka_s, dA_max_s, A0_s = fit_result['scatchard']
+                    r_s, r_over_s = scatchard_transform(cG_M_s, delta_A_s + A0_s, A0_s, A0_s + dA_max_s)
+                    # linear fit
+                    valid = np.isfinite(r_s) & np.isfinite(r_over_s) & (r_s > 0) & (r_s < 1)
+                    if valid.sum() >= 2:
+                        slope_s, intercept_s = np.polyfit(r_s[valid], r_over_s[valid], 1)
+                        r_line = np.linspace(0, 1, 200)
+                        fig_sc = go.Figure()
+                        fig_sc.add_trace(go.Scatter(x=r_s[valid], y=r_over_s[valid],
+                            mode='markers', name="Data", marker=dict(size=9, color='steelblue')))
+                        fig_sc.add_trace(go.Scatter(x=r_line, y=slope_s * r_line + intercept_s,
+                            name=f"Linear fit  slope={slope_s:.3e}",
+                            line=dict(color='crimson', width=2, dash='dash')))
+                        fig_sc.update_layout(height=350,
+                            xaxis_title="r (fractional saturation)",
+                            yaxis_title="r / [L_free]",
+                            title=f"Scatchard Plot  |  Ka = {-slope_s:.3e} M⁻¹  (from slope)")
+                        st.plotly_chart(fig_sc, use_container_width=True)
+                        st.markdown(f"""
 <div class="result-box">
-<b>Hill Fit Results</b><br>
-K<sub>d</sub> = {hill_result["Kd (mM)"]} mM &nbsp;|&nbsp;
-n = {hill_result["Hill n"]} &nbsp;|&nbsp;
-{hill_result["Interpretation"]}
+<b>Scatchard analysis</b><br>
+Slope = −Ka → Ka = <b>{-slope_s:.4e} M⁻¹</b> &nbsp;|&nbsp; Kd = <b>{1/(-slope_s)*1000:.4f} mM</b><br>
+x-intercept (r→) = n binding sites ≈ <b>{-intercept_s/slope_s:.2f}</b>
 </div>""", unsafe_allow_html=True)
 
-                # Excel export
+                # ── Excel export ──
                 ref_x_grid = spectra_tit[0][0]
                 spec_sheet = {'wavelength_nm': ref_x_grid}
-                for xt, yt_c, v in spectra_tit:
-                    spec_sheet[f'A_corr_V={v:.2f}mL'] = np.interp(ref_x_grid, xt, yt_c)
+                for idx_s, (xt, yt_c, _) in enumerate(spectra_tit):
+                    spec_sheet[f'spectrum_{idx_s+1}'] = np.interp(ref_x_grid, xt, yt_c)
                 binding_sheet = pd.DataFrame({
-                    'equiv': equiv_vals, 'free_conc_mM': conc_free, 'response': A_vals})
+                    'x_axis': x_axis_vals, 'conc_free_mM': conc_free_vals, 'response': A_vals})
                 sheets_out = {'Corrected Spectra': pd.DataFrame(spec_sheet),
-                              'Binding Curve':     binding_sheet}
-                if hill_result:
-                    sheets_out['Hill Fit Params'] = pd.DataFrame([hill_result])
+                              'Binding Curve': binding_sheet}
+                if fit_rows:
+                    sheets_out['Fit Parameters'] = pd.DataFrame(fit_rows)
                 xl3 = df_to_excel_bytes(sheets_out)
-                st.download_button("⬇ Download Excel", xl3, file_name="titration_hill.xlsx",
+                st.download_button("⬇ Download Excel", xl3, file_name="binding_analysis.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ─────────────────────────────────────────────────────────────────────────────
